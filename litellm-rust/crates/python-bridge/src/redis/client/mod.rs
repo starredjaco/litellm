@@ -1,3 +1,5 @@
+mod credentials;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, LazyLock, Mutex, PoisonError},
@@ -5,8 +7,9 @@ use std::{
 
 use litellm_config::{ConfiguredRedis, Resolution, SecretSnapshot, Value};
 use litellm_core_utils::settings::ProcessEnvironment;
+use litellm_host_python::PythonContext;
 use litellm_redis_client::{RedisClient, RedisEvents};
-use litellm_redis_connect::{HostServices, SharedEnvironment};
+use litellm_redis_connect::{CredentialSource, HostServices, SharedEnvironment};
 use litellm_redis_types::ResolvedRedis;
 use pyo3::{
     prelude::*,
@@ -14,29 +17,42 @@ use pyo3::{
     types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple},
 };
 
+use self::credentials::PythonCredentialSource;
 use crate::redis::events::{ServiceLoggingEvents, state_label};
 
 /// The `redis_kwargs` dict `RedisCache` hands redis-py, read the way `litellm/_redis.py` reads it.
 /// A `None` stays an explicit null that hides its `REDIS_*` value, as in redis-py. A value that is not
-/// plain data, such as a `credential_provider` object, reaches the resolver by its type name, so the
-/// resolver or the connector names the setting it cannot honor.
-pub(crate) struct PythonRedisSettings(ConfiguredRedis);
+/// plain data reaches the resolver by its type name, so the resolver or the connector names the
+/// setting it cannot honor. A `credential_provider` object is also kept, so the connector can ask it
+/// for credentials.
+pub(crate) struct PythonRedisSettings {
+    settings: ConfiguredRedis,
+    credential_provider: Option<Py<PyAny>>,
+}
 
 impl<'a, 'py> FromPyObject<'a, 'py> for PythonRedisSettings {
     type Error = PyErr;
 
     fn extract(kwargs: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let py = kwargs.py();
+        let kwargs = kwargs.cast::<PyDict>()?;
         let plain = PyDict::new(py);
-        for (name, value) in kwargs.cast::<PyDict>()?.iter() {
+        for (name, value) in kwargs.iter() {
             if value.is_none() || is_plain(&value) {
                 plain.set_item(&name, value)?;
             } else {
                 plain.set_item(&name, value.get_type().name()?)?;
             }
         }
+        let credential_provider = kwargs
+            .get_item("credential_provider")?
+            .filter(|provider| !provider.is_none() && !is_plain(provider))
+            .map(Bound::unbind);
         let fields: BTreeMap<String, Value> = litellm_host_python::from_py_argument(plain.as_any())?;
-        Ok(Self(ConfiguredRedis::redis_cache_kwargs(fields)))
+        Ok(Self {
+            settings: ConfiguredRedis::redis_cache_kwargs(fields),
+            credential_provider,
+        })
     }
 }
 
@@ -52,12 +68,24 @@ fn is_plain(value: &Bound<'_, PyAny>) -> bool {
 
 struct Shared {
     resolved: ResolvedRedis,
+    credential_provider: Option<Py<PyAny>>,
     client: RedisClient,
+}
+
+impl Shared {
+    fn serves(&self, resolved: &ResolvedRedis, credential_provider: Option<&Py<PyAny>>) -> bool {
+        let same_provider = match (&self.credential_provider, credential_provider) {
+            (None, None) => true,
+            (Some(shared), Some(provider)) => shared.is(provider),
+            _ => false,
+        };
+        same_provider && self.resolved == *resolved
+    }
 }
 
 static CLIENTS: LazyLock<Mutex<Vec<Shared>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// The one client for a resolved Redis config, so every family in this process shares its pool
+/// The one client for a resolved Redis config and credential provider, so every family in this process shares its pool
 /// and its breaker. Like redis-py, which never connects at construction, a config the resolver or
 /// the connector cannot honor leaves the family on memory with a warning rather than failing the
 /// `Router`.
@@ -67,12 +95,16 @@ fn shared_client(
     namespace: Option<String>,
 ) -> PyResult<Option<RedisClient>> {
     let environment: SharedEnvironment = Arc::new(ProcessEnvironment);
-    let secrets = match secret_snapshot(py, kwargs.0.secret_names())? {
+    let PythonRedisSettings {
+        settings,
+        credential_provider,
+    } = kwargs;
+    let secrets = match secret_snapshot(py, settings.secret_names())? {
         Ok(secrets) => secrets,
         Err(error) => return Ok(memory_only(py, &error)),
     };
     let logger = crate::logger::capture(py);
-    let resolved = match logger.scope(|| kwargs.0.resolve(&secrets, &*environment)) {
+    let resolved = match logger.scope(|| settings.resolve(&secrets, &*environment)) {
         Ok(Resolution { redis, ignored }) => {
             logger.scope(|| {
                 for ignored in ignored {
@@ -98,11 +130,23 @@ fn shared_client(
         breaker,
         http: crate::http::host_client(py, litellm_http::ClientVariant::Provider)?,
         environment,
+        credential_provider: credential_provider
+            .as_ref()
+            .map(|provider| -> PyResult<Arc<dyn CredentialSource>> {
+                Ok(Arc::new(PythonCredentialSource::new(
+                    provider.clone_ref(py),
+                    PythonContext::capture(py)?,
+                )))
+            })
+            .transpose()?,
     };
     let mut clients = CLIENTS
         .lock_py_attached(py)
         .unwrap_or_else(PoisonError::into_inner);
-    if let Some(shared) = clients.iter().find(|shared| shared.resolved == resolved) {
+    if let Some(shared) = clients
+        .iter()
+        .find(|shared| shared.serves(&resolved, credential_provider.as_ref()))
+    {
         return Ok(Some(shared.client.clone()));
     }
     let connected = {
@@ -118,6 +162,7 @@ fn shared_client(
     };
     clients.push(Shared {
         resolved,
+        credential_provider,
         client: client.clone(),
     });
     Ok(Some(client))

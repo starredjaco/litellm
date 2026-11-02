@@ -82,6 +82,7 @@ pub(crate) async fn connect(
                 breaker,
                 http: resources.http.clone(),
                 environment: resources.lookup.clone(),
+                credential_provider: None,
             },
         )?)
     };
