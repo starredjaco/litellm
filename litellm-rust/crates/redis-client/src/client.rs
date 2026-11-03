@@ -172,6 +172,10 @@ impl RedisClient {
         Pipeline::new(self.namespace.clone())
     }
 
+    pub fn is_cluster(&self) -> bool {
+        matches!(self.connection, Connection::Cluster(_))
+    }
+
     pub fn same_client(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.last_used, &other.last_used)
     }
