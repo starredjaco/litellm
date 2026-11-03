@@ -104,6 +104,7 @@ from tests.unit.proxy.management_endpoints.jwt_key_mapping_doubles import (
     CascadingJWTMappingTable,
     JWTMappingRow,
 )
+from litellm.redis.stores.spend_counters import SpendCounterStore
 
 # Setup TestClient
 client = TestClient(app)
@@ -16630,7 +16631,8 @@ async def test_reset_team_member_spend_fn_success(monkeypatch):
     await real_cache.async_set_cache(key="team-1_member-1", value="stale-membership")
     await real_cache.async_set_cache(key="team_membership:member-1:team-1", value="stale-membership")
     real_spend_counter_cache = DualCache()
-    real_spend_counter_cache.in_memory_cache.set_cache(key="spend:team_member:member-1:team-1", value=999.0)
+    real_spend_counter_store = SpendCounterStore(None)
+    real_spend_counter_store.set_local("spend:team_member:member-1:team-1", 999.0)
 
     membership_row = LiteLLM_TeamMembership(
         user_id="member-1",
@@ -16645,6 +16647,7 @@ async def test_reset_team_member_spend_fn_success(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", real_cache)
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", mock_proxy_logging_obj)
     monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_cache", real_spend_counter_cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_store", real_spend_counter_store)
 
     with patch(  # test-quality-ok: no live DB here; matches this file's established convention for endpoint-logic unit tests
         "litellm.proxy.management_endpoints.team_endpoints.get_team_object",
@@ -16668,7 +16671,7 @@ async def test_reset_team_member_spend_fn_success(monkeypatch):
     assert "spend >= $3" in statement
     assert await real_cache.async_get_cache(key="team-1_member-1") is None
     assert await real_cache.async_get_cache(key="team_membership:member-1:team-1") is None
-    assert real_spend_counter_cache.in_memory_cache.get_cache(key="spend:team_member:member-1:team-1") == 0.0
+    assert real_spend_counter_store.get_local("spend:team_member:member-1:team-1") == 0.0
 
 
 @pytest.mark.asyncio
@@ -16683,7 +16686,8 @@ async def test_reset_team_member_spend_fn_stale_spend_returns_409_and_keeps_cach
     real_cache = UserApiKeyCache()
     await real_cache.async_set_cache(key="team_membership:member-1:team-1", value="cached-membership")
     real_spend_counter_cache = DualCache()
-    real_spend_counter_cache.in_memory_cache.set_cache(key="spend:team_member:member-1:team-1", value=999.0)
+    real_spend_counter_store = SpendCounterStore(None)
+    real_spend_counter_store.set_local("spend:team_member:member-1:team-1", 999.0)
 
     membership_row = LiteLLM_TeamMembership(user_id="member-1", team_id="team-1", spend=10.0)
     mock_prisma_client.db.litellm_teammembership.find_unique = AsyncMock(return_value=membership_row)
@@ -16693,6 +16697,7 @@ async def test_reset_team_member_spend_fn_stale_spend_returns_409_and_keeps_cach
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", real_cache)
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_cache", real_spend_counter_cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_store", real_spend_counter_store)
 
     with patch(  # test-quality-ok: no live DB here; matches this file's established convention for endpoint-logic unit tests
         "litellm.proxy.management_endpoints.team_endpoints.get_team_object",
@@ -16709,7 +16714,7 @@ async def test_reset_team_member_spend_fn_stale_spend_returns_409_and_keeps_cach
 
     assert exc_info.value.status_code == 409
     assert await real_cache.async_get_cache(key="team_membership:member-1:team-1") == "cached-membership"
-    assert real_spend_counter_cache.in_memory_cache.get_cache(key="spend:team_member:member-1:team-1") == 999.0
+    assert real_spend_counter_store.get_local("spend:team_member:member-1:team-1") == 999.0
 
 
 @pytest.mark.asyncio
@@ -17097,7 +17102,8 @@ async def test_team_member_update_invalidates_team_member_spend_state_when_budge
     await real_cache.async_set_cache(key="team-1_member-1", value="stale-membership")
     await real_cache.async_set_cache(key="team_membership:member-1:team-1", value="stale-membership")
     real_spend_counter_cache = DualCache()
-    real_spend_counter_cache.in_memory_cache.set_cache(key="spend:team_member:member-1:team-1", value=999.0)
+    real_spend_counter_store = SpendCounterStore(None)
+    real_spend_counter_store.set_local("spend:team_member:member-1:team-1", 999.0)
 
     team_row = LiteLLM_TeamTable(team_id="team-1", metadata={}, members_with_roles=[])
     team_info_response = {
@@ -17111,6 +17117,7 @@ async def test_team_member_update_invalidates_team_member_spend_state_when_budge
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", real_cache)
     monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_cache", real_spend_counter_cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_store", real_spend_counter_store)
 
     mock_tx = AsyncMock()
     mock_prisma_client.tx.return_value.__aenter__ = AsyncMock(return_value=mock_tx)
@@ -17136,7 +17143,7 @@ async def test_team_member_update_invalidates_team_member_spend_state_when_budge
 
     assert await real_cache.async_get_cache(key="team-1_member-1") is None
     assert await real_cache.async_get_cache(key="team_membership:member-1:team-1") is None
-    assert real_spend_counter_cache.in_memory_cache.get_cache(key="spend:team_member:member-1:team-1") == 999.0
+    assert real_spend_counter_store.get_local("spend:team_member:member-1:team-1") == 999.0
 
 
 @pytest.mark.asyncio
@@ -17150,7 +17157,8 @@ async def test_team_member_update_skips_invalidation_when_no_budget_fields_sent(
     real_cache = UserApiKeyCache()
     await real_cache.async_set_cache(key="team-1_member-1", value="still-fresh-membership")
     real_spend_counter_cache = DualCache()
-    real_spend_counter_cache.in_memory_cache.set_cache(key="spend:team_member:member-1:team-1", value=1.5)
+    real_spend_counter_store = SpendCounterStore(None)
+    real_spend_counter_store.set_local("spend:team_member:member-1:team-1", 1.5)
 
     team_row = LiteLLM_TeamTable(team_id="team-1", metadata={}, members_with_roles=[])
     team_info_response = {
@@ -17164,6 +17172,7 @@ async def test_team_member_update_skips_invalidation_when_no_budget_fields_sent(
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", real_cache)
     monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_cache", real_spend_counter_cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.spend_counter_store", real_spend_counter_store)
 
     mock_tx = AsyncMock()
     mock_prisma_client.tx.return_value.__aenter__ = AsyncMock(return_value=mock_tx)
@@ -17188,7 +17197,7 @@ async def test_team_member_update_skips_invalidation_when_no_budget_fields_sent(
         )
 
     assert await real_cache.async_get_cache(key="team-1_member-1") == "still-fresh-membership"
-    assert real_spend_counter_cache.in_memory_cache.get_cache(key="spend:team_member:member-1:team-1") == 1.5
+    assert real_spend_counter_store.get_local("spend:team_member:member-1:team-1") == 1.5
 
 
 @pytest.mark.asyncio

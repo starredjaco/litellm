@@ -2,6 +2,7 @@ mod policy;
 pub(crate) mod request;
 pub(crate) mod router_cooldowns;
 pub(crate) mod router_usage;
+pub(crate) mod spend_counters;
 
 use litellm_host_python::PythonContext;
 use litellm_redis_store::Number;
