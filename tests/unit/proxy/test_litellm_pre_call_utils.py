@@ -2949,6 +2949,93 @@ def test_get_dynamic_logging_metadata_ignores_env_reference_from_key_metadata(
     assert result is None
 
 
+_ARIZE_REFERENCE_SETTINGS: Final = {
+    "arize_space_a": {
+        "callback_type": "arize",
+        "arize_api_key": "os.environ/LIT10061_ARIZE_API_KEY",
+        "arize_space_id": "os.environ/LIT10061_ARIZE_SPACE_ID",
+        "excluded_services": "postgres,redis",
+    }
+}
+
+
+def _key_auth_referencing(callback_name: str, **callback_vars: str) -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(
+        api_key="test-key",
+        team_id="team-a",
+        metadata={
+            "logging": [{"callback_name": callback_name, "callback_type": "success", "callback_vars": callback_vars}]
+        },
+        team_metadata={},
+    )
+
+
+def test_key_callback_reference_reads_the_secret_manager_on_every_request(monkeypatch):
+    monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+    monkeypatch.setenv("LIT10061_ARIZE_API_KEY", "first-key")
+    monkeypatch.setenv("LIT10061_ARIZE_SPACE_ID", "space-a")
+
+    first: Final = get_dynamic_logging_metadata(
+        user_api_key_dict=_key_auth_referencing("arize_space_a"), proxy_config=MagicMock()
+    )
+    monkeypatch.setenv("LIT10061_ARIZE_API_KEY", "rotated-key")
+    second: Final = get_dynamic_logging_metadata(
+        user_api_key_dict=_key_auth_referencing("arize_space_a"), proxy_config=MagicMock()
+    )
+
+    assert first is not None and second is not None
+    assert first.success_callback == ["arize"]
+    assert first.callback_vars == {"arize_api_key": "first-key", "arize_space_id": "space-a"}
+    assert second.callback_vars["arize_api_key"] == "rotated-key"
+
+
+def test_key_callback_reference_keeps_the_values_the_key_adds(monkeypatch):
+    monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+    monkeypatch.setenv("LIT10061_ARIZE_API_KEY", "first-key")
+    monkeypatch.setenv("LIT10061_ARIZE_SPACE_ID", "space-a")
+
+    result: Final = get_dynamic_logging_metadata(
+        user_api_key_dict=_key_auth_referencing("arize_space_a", turn_off_message_logging="true"),
+        proxy_config=MagicMock(),
+    )
+
+    assert result is not None
+    assert result.callback_vars["turn_off_message_logging"] == "true"
+    assert result.callback_vars["arize_api_key"] == "first-key"
+
+
+def test_key_callback_reference_with_an_unreadable_secret_logs_nowhere(monkeypatch):
+    monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+    monkeypatch.delenv("LIT10061_ARIZE_API_KEY", raising=False)
+    monkeypatch.setenv("LIT10061_ARIZE_SPACE_ID", "space-a")
+
+    result: Final = get_dynamic_logging_metadata(
+        user_api_key_dict=_key_auth_referencing("arize_space_a"), proxy_config=MagicMock()
+    )
+
+    assert result is None
+
+
+def test_team_callback_reference_is_not_resolved(monkeypatch):
+    monkeypatch.setattr(litellm, "callback_settings", _ARIZE_REFERENCE_SETTINGS)
+    monkeypatch.setenv("LIT10061_ARIZE_API_KEY", "first-key")
+    monkeypatch.setenv("LIT10061_ARIZE_SPACE_ID", "space-a")
+    user_api_key_dict: Final = UserAPIKeyAuth(
+        api_key="test-key",
+        team_id="team-a",
+        metadata={},
+        team_metadata={
+            "logging": [{"callback_name": "arize_space_a", "callback_type": "success", "callback_vars": {}}]
+        },
+    )
+
+    result: Final = get_dynamic_logging_metadata(user_api_key_dict=user_api_key_dict, proxy_config=MagicMock())
+
+    assert result is not None
+    assert result.success_callback == ["arize_space_a"]
+    assert "arize_api_key" not in result.callback_vars
+
+
 def test_get_num_retries_from_request():
     """
     Test LiteLLMProxyRequestSetup._get_num_retries_from_request method

@@ -10,6 +10,9 @@ from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 from typing import Final, cast  # noqa: TID251  # preserve arbitrary keys from validated callback mappings
 
+from pydantic import TypeAdapter
+
+import litellm
 from litellm.types.utils import CAPTURE_MESSAGE_CONTENT_VAR, EXCLUDED_SERVICES_VAR
 
 _NEWRELIC_CALLBACK: Final = "newrelic"
@@ -21,6 +24,33 @@ _ARIZE_OTLP_PROTOCOL_VAR: Final = "arize_otlp_protocol"
 _ARIZE_SAMPLING_RATE_VARS: Final[frozenset[str]] = frozenset(
     {"arize_success_sampling_rate", "arize_error_sampling_rate"}
 )
+_GENERIC_API_CALLBACK_TYPE: Final = "generic_api"
+_STRING_KEYED_MAPPING: Final = TypeAdapter(Mapping[str, object])
+
+
+def is_named_callback_definition(definition: object) -> bool:
+    """Whether a ``callback_settings`` entry names a backend a key can reference.
+
+    Such an entry keeps its ``os.environ/`` values past config load, so the secret
+    manager is read on each request that uses it rather than once at boot.
+    """
+    if not isinstance(definition, Mapping):
+        return False
+    callback_type: Final = _STRING_KEYED_MAPPING.validate_python(definition).get("callback_type")
+    return isinstance(callback_type, str) and callback_type != _GENERIC_API_CALLBACK_TYPE
+
+
+def named_callback_definition(callback_name: str) -> Mapping[str, object] | None:
+    raw: Final[object] = litellm.callback_settings.get(callback_name)
+    if not is_named_callback_definition(raw):
+        return None
+    return _STRING_KEYED_MAPPING.validate_python(raw)
+
+
+def callback_backend_name(callback_name: str) -> str:
+    """The backend a key's ``logging`` entry runs on: the definition's ``callback_type`` for a reference."""
+    definition: Final = named_callback_definition(callback_name)
+    return callback_name if definition is None else str(definition["callback_type"])
 
 
 def callback_config_error(
@@ -369,7 +399,7 @@ def _logging_entry_error(entry: object) -> str | None:
         return destination_var_error
     callback_type_raw: Final = typed_entry.get("callback_type")
     return callback_config_error(
-        callback_name,
+        callback_backend_name(callback_name),
         _entry_callback_vars(typed_entry),
         callback_type_raw if isinstance(callback_type_raw, str) else None,
     )
